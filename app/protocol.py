@@ -22,14 +22,19 @@ NAK 后只允许原样重传当前帧，且重传至多两次（即同一帧最�
 引擎在 *解码后的字节流* 上逐字节工作，调用方可以把捕获内容切成任意块——
 块边界可以落在 STX/ETX/CRLF 等控制序列或帧内部中间，解析结果与切分方式无关。
 所有协议错误都携带稳定错误码以及“首个出错块内”的 0 基字节位置。
+
+可选的字节来源证据（请求 ``evidence: "byte_provenance"``）：合法会话的响应会
+额外按逻辑帧给出每次发送尝试（ACK/NAK）覆盖的输入字节位置，以及获 ACK 尝试
+贡献的重组正文切片，使每个输出正文字节恰好追溯到一个获接纳的捕获位置。
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import bisect
 import hashlib
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 # ---- 线路控制字符 -----------------------------------------------------------
 STX = 0x02
@@ -49,6 +54,9 @@ MAX_PAYLOAD = 240
 DIRECTION_SENDER = "sender"
 DIRECTION_RECEIVER = "receiver"
 DIRECTIONS = (DIRECTION_SENDER, DIRECTION_RECEIVER)
+
+# 可选的证据模式：把输出正文字节追溯到获接纳（ACK）的捕获位置
+EVIDENCE_BYTE_PROVENANCE = "byte_provenance"
 
 # 帧号循环：1,2,...,7,0,1,...
 _FRAME_CYCLE = (1, 2, 3, 4, 5, 6, 7, 0)
@@ -95,8 +103,13 @@ def _is_allowed_text(b: int) -> bool:
     return 0x20 <= b <= 0x7E or b == CR
 
 
-def parse_request(body: object) -> Tuple[str, List[Tuple[str, bytes]]]:
-    """校验并解码 HTTP 请求体，返回 ``(sender, [(direction, bytes), ...])``。"""
+def parse_request(body: object) -> Tuple[str, List[Tuple[str, bytes]], bool]:
+    """校验并解码 HTTP 请求体。
+
+    返回 ``(sender, [(direction, bytes), ...], want_evidence)``。
+    ``evidence`` 省略（或为 null）时 ``want_evidence`` 为 False，请求、响应
+    及错误语义与未引入该字段时完全一致。
+    """
     if not isinstance(body, dict):
         raise RequestError("INVALID_REQUEST", "请求体必须为 JSON 对象")
 
@@ -104,6 +117,14 @@ def parse_request(body: object) -> Tuple[str, List[Tuple[str, bytes]]]:
     if not isinstance(sender, str) or not sender.strip() or len(sender) > 128:
         raise RequestError("INVALID_REQUEST", "sender 必须为 1..128 字符的非空字符串")
     sender = sender.strip()
+
+    evidence = body.get("evidence")
+    if evidence is not None and evidence != EVIDENCE_BYTE_PROVENANCE:
+        raise RequestError(
+            "INVALID_REQUEST",
+            f"evidence 仅支持 '{EVIDENCE_BYTE_PROVENANCE}'",
+        )
+    want_evidence = evidence == EVIDENCE_BYTE_PROVENANCE
 
     chunks = body.get("chunks")
     if not isinstance(chunks, list) or not (1 <= len(chunks) <= MAX_CHUNKS):
@@ -138,7 +159,7 @@ def parse_request(body: object) -> Tuple[str, List[Tuple[str, bytes]]]:
             )
         decoded.append((direction, raw))
 
-    return sender, decoded
+    return sender, decoded, want_evidence
 
 
 # 会话阶段
@@ -175,6 +196,11 @@ class _Session:
         self.global_offset = 0
         self.block_index = 0
         self.block_len = 0
+
+        # 字节来源证据：按逻辑帧记录每次发送尝试的全局字节区间与应答结果，
+        # 会话合法结束后由 audit() 换算成按块定位的 segments / payloadSlices。
+        self.frames_evidence: List[dict] = []
+        self.attempt_start = 0  # 当前发送尝试首字节（STX）的全局偏移
 
     def fail(self, code: str, message: str, pos: int) -> None:
         raise ProtocolViolation(
@@ -227,6 +253,7 @@ class _Session:
             if direction != DIRECTION_RECEIVER:
                 self.fail("DIRECTION_VIOLATION", "帧结束后必须由 receiver 应答 ACK/NAK", pos)
             if b == ACK:
+                self.frames_evidence[-1]["attempts"][-1]["result"] = "ACK"
                 self.nak_count = 0
                 self.state = _S_IDLE
                 return
@@ -237,6 +264,7 @@ class _Session:
                         "同一帧最多重传两次（NAK 至多 2 个）",
                         pos,
                     )
+                self.frames_evidence[-1]["attempts"][-1]["result"] = "NAK"
                 self.nak_count += 1
                 self.state = _S_IDLE  # sender 必须立刻重传
                 return
@@ -264,6 +292,7 @@ class _Session:
             self.cksum = bytearray()
             self.retrans = self.nak_count > 0
             self.rt_pos = 0
+            self.attempt_start = self.global_offset  # STX 的全局偏移
             if self.retrans:
                 # pending 第一字节必为 STX
                 self.rt_match(b, pos)
@@ -348,6 +377,12 @@ class _Session:
             [self.terminator]
         ) + bytes(self.cksum) + bytes([CR, LF])
 
+        # 本次发送尝试覆盖的全局半开区间：[STX, 刚收到的 LF]
+        attempt = {
+            "start": self.attempt_start,
+            "end": self.global_offset + 1,
+            "result": None,  # 由随后的 receiver 应答（ACK/NAK）填写
+        }
         if self.retrans:
             # 逐字节比对已保证一致；这里防御性兜底长度。
             if self.rt_pos != len(self.pending):
@@ -359,11 +394,19 @@ class _Session:
                     self.block_len - 1,
                     self.global_offset,
                 )
+            self.frames_evidence[-1]["attempts"].append(attempt)
             self.retransmissions += 1
         else:
             self.frame_count += 1
             self.payload.extend(self.body[1:])  # 去掉帧号
             self.fn_index = (self.fn_index + 1) % 8
+            self.frames_evidence.append(
+                {
+                    "frameNumber": int(chr(self.body[0])),
+                    "payloadLength": len(self.body) - 1,
+                    "attempts": [attempt],
+                }
+            )
         self.pending = wire
         self.state = _S_REPLY
 
@@ -387,20 +430,95 @@ class _Session:
         }
 
 
-def audit(sender: str, decoded: List[Tuple[str, bytes]]) -> dict:
-    """复核整段捕获；decoded 为 ``(direction, raw_bytes)`` 列表。"""
+def _range_to_segments(
+    starts: List[int],
+    chunks_meta: List[Tuple[int, int, int]],
+    start: int,
+    end: int,
+) -> List[Dict[str, int]]:
+    """把全局半开区间 ``[start, end)`` 映射为按块定位的来源段。
+
+    返回 ``[{chunkIndex, offset, length}, ...]``；连续落在同一块内的字节
+    合并为一段，段按捕获顺序排列。
+    """
+    segments: List[Dict[str, int]] = []
+    i = bisect.bisect_right(starts, start) - 1
+    pos = start
+    while pos < end:
+        block_index, gstart, glen = chunks_meta[i]
+        seg_end = min(end, gstart + glen)
+        segments.append(
+            {
+                "chunkIndex": block_index,
+                "offset": pos - gstart,
+                "length": seg_end - pos,
+            }
+        )
+        pos = seg_end
+        i += 1
+    return segments
+
+
+def _build_evidence(
+    frames: List[dict], chunks_meta: List[Tuple[int, int, int]]
+) -> dict:
+    """把会话期间记录的全局字节区间换算成按块定位的字节来源证据。"""
+    starts = [gstart for _, gstart, _ in chunks_meta]
+    out_frames = []
+    payload_pos = 0
+    for frame in frames:
+        attempts = [
+            {
+                "result": a["result"],
+                "segments": _range_to_segments(
+                    starts, chunks_meta, a["start"], a["end"]
+                ),
+            }
+            for a in frame["attempts"]
+        ]
+        # 只有最终获 ACK 的尝试贡献重组正文；合法会话中最后一试必为 ACK。
+        accepted = frame["attempts"][-1]
+        payload_start = accepted["start"] + 2  # 跳过 STX 与帧号
+        payload_end = payload_start + frame["payloadLength"]
+        out_frames.append(
+            {
+                "frameNumber": frame["frameNumber"],
+                "payloadRange": {
+                    "start": payload_pos,
+                    "end": payload_pos + frame["payloadLength"],
+                },
+                "attempts": attempts,
+                "payloadSlices": _range_to_segments(
+                    starts, chunks_meta, payload_start, payload_end
+                ),
+            }
+        )
+        payload_pos += frame["payloadLength"]
+    return {"frames": out_frames}
+
+
+def audit(
+    sender: str, decoded: List[Tuple[str, bytes]], evidence: bool = False
+) -> dict:
+    """复核整段捕获；decoded 为 ``(direction, raw_bytes)`` 列表。
+
+    ``evidence=True`` 时响应附加 ``evidence`` 字段，把每个输出正文字节
+    追溯到获接纳（ACK）的捕获位置；为 False 时响应与既有语义完全一致。
+    """
     session = _Session()
+    chunks_meta: List[Tuple[int, int, int]] = []  # (块下标, 全局起始偏移, 长度)
+    offset = 0
     last_index = 0
     last_len = 0
     for index, (direction, raw) in enumerate(decoded):
         if raw:
+            chunks_meta.append((index, offset, len(raw)))
             last_index = index
             last_len = len(raw)
         session.feed(direction, raw, index, len(raw))
+        offset += len(raw)
     result = session.finish(last_index, last_len)
-    result["sender"] = sender
-    # 重新排一下字段顺序，便于阅读
-    return {
+    out = {
         "ok": True,
         "sender": sender,
         "payload": result["payload"],
@@ -409,3 +527,6 @@ def audit(sender: str, decoded: List[Tuple[str, bytes]]) -> dict:
         "retransmissions": result["retransmissions"],
         "sha256": result["sha256"],
     }
+    if evidence:
+        out["evidence"] = _build_evidence(session.frames_evidence, chunks_meta)
+    return out

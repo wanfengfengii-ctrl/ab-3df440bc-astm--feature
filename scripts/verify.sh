@@ -31,7 +31,7 @@ echo "==> 2/3 构建检查（字节码编译 + 应用导入）"
 python -m compileall -q app scripts
 python -c "from app.main import app; print('应用导入成功：', app.title)"
 
-echo "==> 3/3 API 冒烟（跨块切分 + NAK 重传）"
+echo "==> 3/3 API 冒烟（跨块切分 + NAK 重传 + 字节来源映射）"
 python scripts/smoke.py "${BASE_URL}"
 
 echo "==> 全部校验通过"

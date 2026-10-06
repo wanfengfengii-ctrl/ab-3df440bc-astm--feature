@@ -5,7 +5,9 @@
     python scripts/smoke.py [BASE_URL]
 
 覆盖：健康检查、跨块（每块 1 字节）合法会话且含 NAK 重传、校验失败、
-方向越权、非原样重传、坏 Base64。全部通过则以退出码 0 结束。
+方向越权、非原样重传、坏 Base64，以及 evidence=byte_provenance 下的
+跨块与重传来源映射（每个输出正文字节恰好映射到一个获接纳的捕获位置）。
+全部通过则以退出码 0 结束。
 """
 
 from __future__ import annotations
@@ -72,6 +74,73 @@ def to_chunks(events, piece: int = 1) -> list[dict]:
     return chunks
 
 
+def read_slice(chunks: list[dict], seg: dict) -> bytes:
+    """按来源段定位从提交块中读回字节。"""
+    raw = base64.b64decode(chunks[seg["chunkIndex"]]["data"])
+    return raw[seg["offset"] : seg["offset"] + seg["length"]]
+
+
+def provenance_ok(body: dict, chunks: list[dict], expected_payload: bytes) -> bool:
+    """校验 byte_provenance 证据的来源映射不变量。
+
+    每个输出正文字节恰好映射到一个获接纳（ACK）的捕获位置；每次发送尝试
+    的分段拼出完整线路帧；仅最后一试为 ACK；重传后来源指向获接纳的副本。
+    """
+    evidence = body.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    frames = evidence.get("frames")
+    if not isinstance(frames, list) or len(frames) != body.get("frame_count"):
+        return False
+    pos = 0
+    retrans = 0
+    covered: set[tuple[int, int]] = set()
+    for frame in frames:
+        rng = frame.get("payloadRange") or {}
+        if rng.get("start") != pos or not isinstance(rng.get("end"), int):
+            return False
+        attempts = frame.get("attempts") or []
+        if not attempts or attempts[-1].get("result") != "ACK":
+            return False
+        if any(a.get("result") != "NAK" for a in attempts[:-1]):
+            return False
+        retrans += len(attempts) - 1
+        ack_chunks = set()
+        nak_chunks = set()
+        for att in attempts:
+            segments = att.get("segments") or []
+            if not segments:
+                return False
+            wire = b"".join(read_slice(chunks, s) for s in segments)
+            if not (wire.startswith(bytes([STX])) and wire.endswith(bytes([CR, LF]))):
+                return False
+            chunk_ids = {s["chunkIndex"] for s in segments}
+            if att is attempts[-1]:
+                ack_chunks = chunk_ids
+            else:
+                nak_chunks |= chunk_ids
+        # 重传后来源必须指向获接纳的副本，而非被 NAK 的首次发送
+        if nak_chunks & ack_chunks:
+            return False
+        slices = frame.get("payloadSlices") or []
+        if any(s["chunkIndex"] not in ack_chunks for s in slices):
+            return False
+        data = b"".join(read_slice(chunks, s) for s in slices)
+        if data != expected_payload[rng["start"] : rng["end"]]:
+            return False
+        for s in slices:
+            for i in range(s["offset"], s["offset"] + s["length"]):
+                key = (s["chunkIndex"], i)
+                if key in covered:
+                    return False
+                covered.add(key)
+        pos = rng["end"]
+    return (
+        pos == len(expected_payload) == body.get("payload_bytes")
+        and retrans == body.get("retransmissions")
+    )
+
+
 RESULTS: list[tuple[str, bool, str]] = []
 
 
@@ -111,6 +180,7 @@ def main() -> int:
         and body.get("retransmissions") == 1
         and body.get("sha256") == hashlib.sha256(expected_payload).hexdigest()
         and body.get("payload_bytes") == len(expected_payload)
+        and "evidence" not in body  # 省略 evidence 时响应语义不变
     )
     check("跨块合法会话（含 1 次重传）返回重组结果", ok, f"status={status}, body={body}")
 
@@ -185,6 +255,40 @@ def main() -> int:
     check(
         "坏 Base64 返回 400（BAD_BASE64）",
         status == 400 and body.get("code") == "BAD_BASE64",
+        f"status={status}, body={body}",
+    )
+
+    # 6) 字节来源映射：evidence=byte_provenance，跨块（3 字节/块）+ NAK 重传
+    prov_chunks = to_chunks(events, piece=3)
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "evidence": "byte_provenance",
+            "chunks": prov_chunks,
+        },
+    )
+    ok = status == 200 and provenance_ok(body, prov_chunks, expected_payload)
+    check(
+        "字节来源映射：跨块 + 重传会话可追溯到获接纳位置",
+        ok,
+        f"status={status}, body={body}",
+    )
+
+    # 7) 非法 evidence 取值 → 400
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "evidence": "full",
+            "chunks": to_chunks(events, piece=1),
+        },
+    )
+    check(
+        "非法 evidence 取值返回 400（INVALID_REQUEST）",
+        status == 400 and body.get("code") == "INVALID_REQUEST",
         f"status={status}, body={body}",
     )
 

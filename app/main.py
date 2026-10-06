@@ -41,5 +41,5 @@ async def audit_session(request: Request) -> dict:
         body = json.loads(raw.decode("utf-8")) if raw else None
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise RequestError("INVALID_REQUEST", "请求体必须为合法 UTF-8 JSON")
-    sender, decoded = parse_request(body)
-    return audit(sender, decoded)
+    sender, decoded, evidence = parse_request(body)
+    return audit(sender, decoded, evidence=evidence)

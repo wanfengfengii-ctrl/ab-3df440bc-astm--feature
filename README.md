@@ -53,6 +53,45 @@ STX FN PAYLOAD (ETB|ETX) HEX HEX CR LF
 }
 ```
 
+#### 可选：`"evidence": "byte_provenance"`（字节来源追溯）
+
+请求体加入 `"evidence": "byte_provenance"` 后，合法会话的响应额外携带 `evidence`
+字段，把已接纳正文追溯到原始抓取位置；省略该字段时请求、响应及错误语义完全不变。
+
+```json
+{
+  "ok": true,
+  "sender": "analyzer-A",
+  "payload": "…",
+  "evidence": {
+    "frames": [
+      {
+        "frameNumber": 1,
+        "payloadRange": {"start": 0, "end": 20},
+        "attempts": [
+          {"result": "NAK", "segments": [{"chunkIndex": 2, "offset": 0, "length": 27}]},
+          {"result": "ACK", "segments": [{"chunkIndex": 4, "offset": 0, "length": 27}]}
+        ],
+        "payloadSlices": [{"chunkIndex": 4, "offset": 2, "length": 20}]
+      }
+    ]
+  }
+}
+```
+
+- `frameNumber`：线路帧号（按 `1..7, 0` 循环）；
+- `payloadRange`：该帧正文在重组正文中的半开区间 `[start, end)`；
+- `attempts`：该逻辑帧的每次发送尝试。`result` 为 `ACK` 或 `NAK`；`segments`
+  用 `chunkIndex`/`offset`/`length` 定位该次完整帧（`STX` 到 `CRLF`）覆盖的输入
+  字节，连续落在同一块内的来源合并为一段；
+- `payloadSlices`：只有最终获 `ACK` 的尝试贡献重组正文，同样按块合并定位；
+  被 `NAK` 的尝试只出现在 `attempts` 中，不贡献正文。
+
+保证：合法结果中每个输出正文字节恰好映射到一个获接纳的捕获位置；重传统计、
+正文与摘要（`retransmissions`/`payload`/`sha256` 等）仍按既有规则生成。
+`evidence` 仅支持 `"byte_provenance"`，其他取值返回 `400`（`INVALID_REQUEST`）；
+协议错误仍按现有状态码与首错位置拒绝，且不返回部分证据。
+
 协议违例返回 `422`，错误码稳定，并给出**首个出错块内**的 0 基位置 `position` 及全局偏移 `global_offset`：
 
 ```json
@@ -98,7 +137,7 @@ ASTM_HOST_PORT=8080 docker compose up --build
 - `api`：常驻 API 服务，带健康检查；
 - `verify`：一次性服务，等 `api` 健康后依次执行
   单元测试（pytest）、构建检查（字节码编译 + 应用导入）、
-  含跨块切分与 NAK 重传的 API 冒烟，以退出码报告结果后自行退出：
+  含跨块切分、NAK 重传与字节来源映射的 API 冒烟，以退出码报告结果后自行退出：
 
 ```bash
 docker compose up --build verify
