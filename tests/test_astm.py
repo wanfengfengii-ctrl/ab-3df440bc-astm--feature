@@ -325,6 +325,187 @@ def test_cr_allowed_inside_payload():
     assert result["sha256"] == hashlib.sha256(payload).hexdigest()
 
 
+# ---- byte_provenance 证据 ---------------------------------------------------
+
+def _slice_bytes(chunks, slices):
+    out = bytearray()
+    for s in slices:
+        raw = chunks[s["chunkIndex"]][1]
+        out += raw[s["offset"] : s["offset"] + s["length"]]
+    return bytes(out)
+
+
+def _assert_provenance(result, chunks, frame_wires):
+    assert "evidence" not in audit("x", chunks)  # 省略时无证据
+    ev = result["evidence"]
+    assert ev["type"] == "byte_provenance"
+    frames = ev["frames"]
+    assert len(frames) == len(frame_wires)
+
+    cursor = 0
+    accepted = set()
+    for i, (fr, wire) in enumerate(zip(frames, frame_wires)):
+        assert fr["frameNumber"] == i + 1
+        payload_wire = wire[2:-5]
+        assert fr["payloadRange"] == [cursor, cursor + len(payload_wire)]
+        attempts = fr["attempts"]
+        # 最后一次必须 ACK，其余必须 NAK
+        assert attempts[-1]["result"] == "ACK"
+        assert all(a["result"] == "NAK" for a in attempts[:-1])
+        # 每次尝试的区间都重组出该次完整帧
+        for att in attempts:
+            assert _slice_bytes(chunks, att["chunks"]) == wire
+        # 同块连续来源已合并：不存在可再合并的相邻区间
+        for group in (fr["payloadSlices"], *(a["chunks"] for a in attempts)):
+            for prev, cur in zip(group, group[1:]):
+                assert not (
+                    prev["chunkIndex"] == cur["chunkIndex"]
+                    and prev["offset"] + prev["length"] == cur["offset"]
+                )
+        # payloadSlices 只来自 ACK 尝试且恰好覆盖正文
+        assert _slice_bytes(chunks, fr["payloadSlices"]) == payload_wire
+        for s in fr["payloadSlices"]:
+            for j in range(s["offset"], s["offset"] + s["length"]):
+                loc = (s["chunkIndex"], j)
+                assert loc not in accepted  # 每个输出字节恰好一个位置
+                accepted.add(loc)
+        cursor += len(payload_wire)
+    assert result["payload_bytes"] == cursor
+
+
+def test_provenance_basic_session():
+    f1 = make_frame(1, b"abc")
+    f2 = make_frame(2, b"de", terminator=ETX)
+    events = [
+        ("sender", bytes([ENQ])),
+        ("receiver", bytes([ACK])),
+        ("sender", f1),
+        ("receiver", bytes([ACK])),
+        ("sender", f2),
+        ("receiver", bytes([ACK])),
+        ("sender", bytes([EOT])),
+    ]
+    result = audit("x", events, evidence="byte_provenance")
+    _assert_provenance(result, events, [f1, f2])
+    # 无重传时每帧恰好一次 ACK 尝试
+    for fr in result["evidence"]["frames"]:
+        assert [a["result"] for a in fr["attempts"]] == ["ACK"]
+
+
+def test_provenance_cross_chunk_with_retransmission():
+    # 跨 1 字节/块，f1 经历 1 次 NAK
+    for piece in (1, 3, 7):
+        chunks = chunks_for(valid_events(), piece)
+        result = audit("x", chunks, evidence="byte_provenance")
+        f1 = make_frame(1, b"H|\\^&|||analyzer^1.0")
+        f2 = make_frame(2, b"O|1||^^^ASTM^M|||", terminator=ETX)
+        _assert_provenance(result, chunks, [f1, f2])
+        frame1 = result["evidence"]["frames"][0]
+        assert [a["result"] for a in frame1["attempts"]] == ["NAK", "ACK"]
+        # NAK 尝试与 ACK 尝试覆盖的帧线路字节相同，但来源位置不同
+        assert frame1["attempts"][0]["chunks"] != frame1["attempts"][1]["chunks"]
+        frame2 = result["evidence"]["frames"][1]
+        assert [a["result"] for a in frame2["attempts"]] == ["ACK"]
+
+
+def test_provenance_two_naks_then_ack():
+    f1 = make_frame(1, b"abc")
+    events = [
+        ("sender", bytes([ENQ])),
+        ("receiver", bytes([ACK])),
+        ("sender", f1),
+        ("receiver", bytes([NAK])),
+        ("sender", f1),
+        ("receiver", bytes([NAK])),
+        ("sender", f1),
+        ("receiver", bytes([ACK])),
+        ("sender", bytes([EOT])),
+    ]
+    chunks = chunks_for(events, 2)
+    result = audit("x", chunks, evidence="byte_provenance")
+    _assert_provenance(result, chunks, [f1])
+    assert [a["result"] for a in result["evidence"]["frames"][0]["attempts"]] == [
+        "NAK",
+        "NAK",
+        "ACK",
+    ]
+
+
+def test_provenance_consecutive_bytes_in_same_chunk_merge():
+    f1 = make_frame(1, b"abcdefgh")  # 整帧放在单个块
+    events = [
+        ("sender", bytes([ENQ])),
+        ("receiver", bytes([ACK])),
+        ("sender", f1),
+        ("receiver", bytes([ACK])),
+        ("sender", bytes([EOT])),
+    ]
+    result = audit("x", events, evidence="byte_provenance")
+    fr = result["evidence"]["frames"][0]
+    # 完整帧落在同一块 -> 单次尝试只有一个区间
+    assert fr["attempts"][0]["chunks"] == [{"chunkIndex": 2, "offset": 0, "length": len(f1)}]
+    # 正文同样合并为一个区间（跳过 STX、FN）
+    assert fr["payloadSlices"] == [
+        {"chunkIndex": 2, "offset": 2, "length": 8}
+    ]
+
+
+def test_provenance_error_returns_no_partial_evidence():
+    # 协议违例时不返回任何证据（422 错误体无 evidence）
+    events = list(valid_events())
+    events[0] = ("receiver", bytes([ENQ]))
+    with pytest.raises(ProtocolViolation):
+        audit("x", events, evidence="byte_provenance")
+
+
+def test_parse_request_rejects_unknown_evidence():
+    from app.protocol import RequestError
+
+    body = {
+        "sender": "x",
+        "evidence": "something_else",
+        "chunks": [{"direction": "sender", "data": ""}],
+    }
+    with pytest.raises(RequestError) as exc:
+        parse_request(body)
+    assert exc.value.code == "INVALID_REQUEST"
+
+
+def test_api_provenance_cross_chunk():
+    resp = _post(valid_events(), piece=1)
+    assert "evidence" not in resp.json()
+    decoded = chunks_for(valid_events(), 1)
+    body = {
+        "sender": "analyzer-A",
+        "evidence": "byte_provenance",
+        "chunks": [
+            {"direction": d, "data": base64.b64encode(raw).decode()}
+            for d, raw in decoded
+        ],
+    }
+    resp = client.post("/api/astm/sessions/audit", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["evidence"]["type"] == "byte_provenance"
+    assert len(data["evidence"]["frames"]) == 2
+    # 统计字段仍按既有规则生成
+    assert data["frame_count"] == 2
+    assert data["retransmissions"] == 1
+
+
+def test_api_bad_evidence_is_400():
+    resp = client.post(
+        "/api/astm/sessions/audit",
+        json={
+            "sender": "x",
+            "evidence": "nope",
+            "chunks": [{"direction": "sender", "data": ""}],
+        },
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "INVALID_REQUEST"
+
+
 # ---- 请求解析与 HTTP 层 ----------------------------------------------------
 
 def _post(events, piece=None, sender="analyzer-A"):

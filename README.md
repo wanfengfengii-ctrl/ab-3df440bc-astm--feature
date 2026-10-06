@@ -66,6 +66,47 @@ STX FN PAYLOAD (ETB|ETX) HEX HEX CR LF
 }
 ```
 
+### 字节来源证据（可选）
+
+请求带 `"evidence": "byte_provenance"` 时，成功响应额外返回 `evidence`，
+按**逻辑帧**给出重组正文的原始捕获位置，使每个输出正文字节都能追溯到一次
+被 ACK 接纳的发送尝试：
+
+```json
+{
+  "evidence": {
+    "type": "byte_provenance",
+    "frames": [
+      {
+        "frameNumber": 1,
+        "payloadRange": [0, 18],
+        "attempts": [
+          {"result": "NAK", "chunks": [{"chunkIndex": 2, "offset": 0, "length": 23}]},
+          {"result": "ACK", "chunks": [{"chunkIndex": 4, "offset": 0, "length": 23}]}
+        ],
+        "payloadSlices": [{"chunkIndex": 4, "offset": 2, "length": 18}]
+      }
+    ]
+  }
+}
+```
+
+- `frameNumber`：逻辑帧序号（从 1 开始，NAK 重传不增加序号）；
+- `payloadRange`：该帧正文在重组正文中的**半开区间** `[start, end)`；
+- `attempts`：该帧的每次发送尝试，按发生顺序排列，`result` 标明最终收到的
+  是 `ACK` 还是 `NAK`（最后一次必为 `ACK`，其余为 `NAK`）；
+  `chunks` 用 `chunkIndex`（请求块下标）、`offset`（块内 0 基偏移）、
+  `length` 定位**该次完整帧**（STX..CRLF）覆盖的输入字节；
+- `payloadSlices`：仅由**最终获 ACK** 的尝试贡献，定位该帧正文（不含
+  STX、帧号、结束符、校验和、CRLF）覆盖的输入字节；连续落在同一块内的
+  来源已合并为一个半开区间；
+- 每个输出正文字节恰好映射到一个获接纳的捕获位置；NAK 尝试的字节不贡献
+  重组正文。
+
+省略 `evidence`（或为 `null`）时，请求、成功响应与错误语义完全不变；
+协议错误仍按既有状态码与首错位置拒绝，且**不**返回任何部分证据。
+非法 `evidence` 值返回 `400 INVALID_REQUEST`。
+
 错误码：
 
 | 代码 | 含义 |

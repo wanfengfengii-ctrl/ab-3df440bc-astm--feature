@@ -72,6 +72,98 @@ def to_chunks(events, piece: int = 1) -> list[dict]:
     return chunks
 
 
+def _read_slices(slices: list[dict], raws: list[bytes]) -> bytes:
+    """按 [{chunkIndex, offset, length}] 半开区间重组字节。"""
+    out = bytearray()
+    for s in slices:
+        ci, off, ln = s["chunkIndex"], s["offset"], s["length"]
+        if not isinstance(ln, int) or ln < 1:
+            raise ValueError("length 必须为正整数")
+        if not (0 <= off and off + ln <= len(raws[ci])):
+            raise ValueError("区间越界")
+        out += raws[ci][off : off + ln]
+    return bytes(out)
+
+
+def check_provenance(body: dict, chunks: list[dict], expected_wire: list[bytes]) -> bool:
+    """校验 byte_provenance 证据。
+
+    * 每个逻辑帧返回 frameNumber、半开 payloadRange、每次发送尝试（ACK/NAK）；
+    * 每次尝试的 chunks 区间重组出该次完整帧线路字节；
+    * payloadSlices 只来自最终 ACK 尝试，重组出全部正文；
+    * 每个输出正文字节恰好映射到一个获接纳捕获位置（无重复、NAK 位置不贡献）。
+
+    ``expected_wire`` 为每个逻辑帧的线路字节（重传内容相同）。
+    """
+    try:
+        evidence = body.get("evidence")
+        if not isinstance(evidence, dict) or evidence.get("type") != "byte_provenance":
+            return False
+        frames = evidence.get("frames")
+        raws = [base64.b64decode(c["data"]) for c in chunks]
+        dirs = [c["direction"] for c in chunks]
+        if not isinstance(frames, list) or len(frames) != body.get("frame_count"):
+            return False
+
+        cursor = 0
+        reassembled = b""
+        accepted: set[tuple[int, int]] = set()
+        for fi, fr in enumerate(frames):
+            if fr.get("frameNumber") != fi + 1:
+                return False
+            attempts = fr.get("attempts")
+            if not isinstance(attempts, list) or not attempts:
+                return False
+            results = [a.get("result") for a in attempts]
+            if results[-1] != "ACK" or any(r != "NAK" for r in results[:-1]):
+                return False
+
+            nak_positions: set[tuple[int, int]] = set()
+            for ai, att in enumerate(attempts):
+                if _read_slices(att.get("chunks"), raws) != expected_wire[fi]:
+                    return False  # 该次尝试必须覆盖完整帧
+                for s in att["chunks"]:
+                    if dirs[s["chunkIndex"]] != "sender":
+                        return False
+                    for j in range(s["offset"], s["offset"] + s["length"]):
+                        if results[ai] == "NAK":
+                            nak_positions.add((s["chunkIndex"], j))
+                # 同块连续来源必须已合并：相邻区间不得可再合并
+                prev = None
+                for s in att["chunks"]:
+                    if prev is not None:
+                        pci, p = prev
+                        if s["chunkIndex"] == pci and s["offset"] == p["offset"] + p["length"]:
+                            return False
+                    prev = (s["chunkIndex"], s)
+
+            slices = fr.get("payloadSlices")
+            payload_wire = expected_wire[fi][2:-5]  # 去 STX FN 与 TERM cs cs CR LF
+            if _read_slices(slices, raws) != payload_wire:
+                return False
+
+            rng = fr.get("payloadRange")
+            if rng != [cursor, cursor + len(payload_wire)]:
+                return False
+
+            for s in slices:
+                if dirs[s["chunkIndex"]] != "sender":
+                    return False
+                for j in range(s["offset"], s["offset"] + s["length"]):
+                    pos = (s["chunkIndex"], j)
+                    if pos in accepted or pos in nak_positions:
+                        return False  # 每字节恰好一个获接纳位置，且不来自 NAK 尝试
+                    accepted.add(pos)
+            reassembled += payload_wire
+            cursor += len(payload_wire)
+
+        if body.get("payload_bytes") != cursor:
+            return False
+        return reassembled == b"".join(expected_wire[i][2:-5] for i in range(len(frames)))
+    except (KeyError, TypeError, ValueError, IndexError, AssertionError):
+        return False
+
+
 RESULTS: list[tuple[str, bool, str]] = []
 
 
@@ -113,6 +205,67 @@ def main() -> int:
         and body.get("payload_bytes") == len(expected_payload)
     )
     check("跨块合法会话（含 1 次重传）返回重组结果", ok, f"status={status}, body={body}")
+
+    # 1b) 启用 byte_provenance：跨块 + NAK 重传来源映射
+    submit_chunks = to_chunks(events, piece=1)
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "evidence": "byte_provenance",
+            "chunks": submit_chunks,
+        },
+    )
+    ok = status == 200 and check_provenance(body, submit_chunks, [f1, f2])
+    check(
+        "byte_provenance：每字节唯一映射到获 ACK 位置，NAK 尝试不贡献正文",
+        ok,
+        f"status={status}, body={body}",
+    )
+
+    # 1b-2) 较大块切分（7 字节/块）：同块连续来源必须合并
+    submit_chunks7 = to_chunks(events, piece=7)
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {
+            "sender": "analyzer-A",
+            "evidence": "byte_provenance",
+            "chunks": submit_chunks7,
+        },
+    )
+
+    def has_merged_slice(b: dict) -> bool:
+        try:
+            for fr in b["evidence"]["frames"]:
+                if any(s["length"] > 1 for s in fr["payloadSlices"]):
+                    return True
+                for att in fr["attempts"]:
+                    if any(s["length"] > 1 for s in att["chunks"]):
+                        return True
+        except (KeyError, TypeError):
+            return False
+        return False
+
+    ok = (
+        status == 200
+        and check_provenance(body, submit_chunks7, [f1, f2])
+        and has_merged_slice(body)
+    )
+    check("byte_provenance：同块连续来源合并为半开区间", ok, f"status={status}, body={body}")
+
+    # 1c) 省略 evidence 时响应不含证据字段（语义不变）
+    status, body = request(
+        "POST",
+        "/api/astm/sessions/audit",
+        {"sender": "analyzer-A", "chunks": to_chunks(events, piece=1)},
+    )
+    check(
+        "省略 evidence 时响应不包含证据字段",
+        status == 200 and "evidence" not in body,
+        f"status={status}, body={body}",
+    )
 
     # 2) 校验失败：破坏 f2 的校验和，且跨块提交
     bad_f2 = bytearray(f2)

@@ -95,10 +95,25 @@ def _is_allowed_text(b: int) -> bool:
     return 0x20 <= b <= 0x7E or b == CR
 
 
-def parse_request(body: object) -> Tuple[str, List[Tuple[str, bytes]]]:
-    """校验并解码 HTTP 请求体，返回 ``(sender, [(direction, bytes), ...])``。"""
+EVIDENCE_BYTE_PROVENANCE = "byte_provenance"
+
+
+def parse_request(body: object) -> Tuple[str, List[Tuple[str, bytes]], str | None]:
+    """校验并解码 HTTP 请求体。
+
+    返回 ``(sender, [(direction, bytes), ...], evidence)``；``evidence`` 为
+    ``None``（省略）或 ``"byte_provenance"``。
+    """
     if not isinstance(body, dict):
         raise RequestError("INVALID_REQUEST", "请求体必须为 JSON 对象")
+
+    evidence = body.get("evidence")
+    if evidence is not None and evidence != EVIDENCE_BYTE_PROVENANCE:
+        raise RequestError(
+            "INVALID_REQUEST",
+            f"evidence 只能省略或取值 {EVIDENCE_BYTE_PROVENANCE!r}",
+        )
+    evidence_mode = evidence if evidence == EVIDENCE_BYTE_PROVENANCE else None
 
     sender = body.get("sender")
     if not isinstance(sender, str) or not sender.strip() or len(sender) > 128:
@@ -138,7 +153,7 @@ def parse_request(body: object) -> Tuple[str, List[Tuple[str, bytes]]]:
             )
         decoded.append((direction, raw))
 
-    return sender, decoded
+    return sender, decoded, evidence_mode
 
 
 # 会话阶段
@@ -155,7 +170,7 @@ _S_DONE = "done"              # EOT 之后，会话结束
 
 
 class _Session:
-    def __init__(self) -> None:
+    def __init__(self, collect_evidence: bool = False) -> None:
         self.state = _S_ENQ
         self.frame_count = 0
         self.retransmissions = 0
@@ -175,6 +190,15 @@ class _Session:
         self.global_offset = 0
         self.block_index = 0
         self.block_len = 0
+
+        # ---- byte_provenance 证据收集 ----
+        self.collect_evidence = collect_evidence
+        # 当前逻辑帧的各次发送尝试；每项为
+        # {"result": "ACK"|"NAK"|None, "locs": [(chunk_index, pos), ...]}
+        self.frame_attempts: List[dict] = []
+        self.frame_locs: List[Tuple[int, int]] = []  # 本次尝试整帧逐字节位置
+        # 已被 ACK 接纳的逻辑帧证据
+        self.frames_evidence: List[dict] = []
 
     def fail(self, code: str, message: str, pos: int) -> None:
         raise ProtocolViolation(
@@ -197,6 +221,17 @@ class _Session:
         self.block_index = block_index
         self.block_len = block_len
         for pos, b in enumerate(raw):
+            if self.collect_evidence and direction == DIRECTION_SENDER:
+                # 在状态转移前记录：STX 开启一次新的发送尝试，其余帧组装
+                # 状态（正文/校验和/CRLF）内的字节逐字节追加到本次尝试。
+                st = self.state
+                if st == _S_IDLE and b == STX:
+                    if self.nak_count == 0:
+                        # 新逻辑帧：丢弃上一帧的尝试记录（上一帧已在 ACK 时归档）
+                        self.frame_attempts = []
+                    self.frame_locs = [(block_index, pos, self.global_offset)]
+                elif st in (_S_BODY, _S_CKSUM1, _S_CKSUM2, _S_CR, _S_LF):
+                    self.frame_locs.append((block_index, pos, self.global_offset))
             self._byte(direction, b, pos)
             self.global_offset += 1
 
@@ -227,6 +262,7 @@ class _Session:
             if direction != DIRECTION_RECEIVER:
                 self.fail("DIRECTION_VIOLATION", "帧结束后必须由 receiver 应答 ACK/NAK", pos)
             if b == ACK:
+                self._record_reply("ACK")
                 self.nak_count = 0
                 self.state = _S_IDLE
                 return
@@ -237,6 +273,7 @@ class _Session:
                         "同一帧最多重传两次（NAK 至多 2 个）",
                         pos,
                     )
+                self._record_reply("NAK")
                 self.nak_count += 1
                 self.state = _S_IDLE  # sender 必须立刻重传
                 return
@@ -343,7 +380,57 @@ class _Session:
             self._frame_complete()
             return
 
+    # ---- byte_provenance 证据 ----------------------------------------------
+
+    @staticmethod
+    def _merge_locs(locs: List[Tuple[int, int, int]]) -> List[dict]:
+        """把逐字节位置合并为同一块内连续的半开区间。
+
+        ``locs`` 每项为 ``(chunk_index, position, global_offset)``；
+        相邻字节只有在 *同一块* 内且 ``position`` 连续时才合并。
+        """
+        slices: List[dict] = []
+        for chunk_index, pos, _global in locs:
+            if slices and slices[-1]["chunkIndex"] == chunk_index and \
+                    slices[-1]["offset"] + slices[-1]["length"] == pos:
+                slices[-1]["length"] += 1
+            else:
+                slices.append({"chunkIndex": chunk_index, "offset": pos, "length": 1})
+        return slices
+
+    def _frame_complete_evidence(self) -> None:
+        """本次发送尝试的整帧字节已收齐（STX..LF）。"""
+        self.frame_attempts.append({"result": None, "locs": self.frame_locs})
+        self.frame_locs = []
+
+    def _record_reply(self, result: str) -> None:
+        """receiver 对最近一次发送尝试给出 ACK/NAK。"""
+        if not self.collect_evidence or not self.frame_attempts:
+            return
+        self.frame_attempts[-1]["result"] = result
+        if result == "ACK":
+            # 只有最终获 ACK 的尝试可贡献重组正文；归档整个逻辑帧。
+            attempts_out = [
+                {"result": att["result"], "chunks": self._merge_locs(att["locs"])}
+                for att in self.frame_attempts
+            ]
+            acked_locs = self.frame_attempts[-1]["locs"]
+            # 线路布局：STX FN PAYLOAD TERM HEX HEX CR LF
+            # 正文 = 去掉前 2 字节（STX、帧号）与后 5 字节
+            # （结束符、两位校验和、CR、LF）。
+            payload_locs = acked_locs[2:-5]
+            self.frames_evidence.append(
+                {
+                    "frameNumber": self.frame_count,
+                    "payload_length": len(payload_locs),
+                    "attempts": attempts_out,
+                    "payloadSlices": self._merge_locs(payload_locs),
+                }
+            )
+
     def _frame_complete(self) -> None:
+        if self.collect_evidence:
+            self._frame_complete_evidence()
         wire = bytes([STX]) + bytes(self.body) + bytes(
             [self.terminator]
         ) + bytes(self.cksum) + bytes([CR, LF])
@@ -377,7 +464,7 @@ class _Session:
                 self.global_offset,
             )
         payload_bytes = bytes(self.payload)
-        return {
+        result = {
             "ok": True,
             "payload": payload_bytes.decode("latin-1"),
             "payload_bytes": len(payload_bytes),
@@ -385,11 +472,31 @@ class _Session:
             "retransmissions": self.retransmissions,
             "sha256": hashlib.sha256(payload_bytes).hexdigest(),
         }
+        if self.collect_evidence:
+            frames_out = []
+            payload_cursor = 0
+            for ev in self.frames_evidence:
+                length = ev["payload_length"]
+                frames_out.append(
+                    {
+                        "frameNumber": ev["frameNumber"],
+                        "payloadRange": [payload_cursor, payload_cursor + length],
+                        "attempts": ev["attempts"],
+                        "payloadSlices": ev["payloadSlices"],
+                    }
+                )
+                payload_cursor += length
+            result["evidence"] = {"type": EVIDENCE_BYTE_PROVENANCE, "frames": frames_out}
+        return result
 
 
-def audit(sender: str, decoded: List[Tuple[str, bytes]]) -> dict:
+def audit(
+    sender: str,
+    decoded: List[Tuple[str, bytes]],
+    evidence: str | None = None,
+) -> dict:
     """复核整段捕获；decoded 为 ``(direction, raw_bytes)`` 列表。"""
-    session = _Session()
+    session = _Session(collect_evidence=evidence == EVIDENCE_BYTE_PROVENANCE)
     last_index = 0
     last_len = 0
     for index, (direction, raw) in enumerate(decoded):
@@ -400,7 +507,7 @@ def audit(sender: str, decoded: List[Tuple[str, bytes]]) -> dict:
     result = session.finish(last_index, last_len)
     result["sender"] = sender
     # 重新排一下字段顺序，便于阅读
-    return {
+    ordered = {
         "ok": True,
         "sender": sender,
         "payload": result["payload"],
@@ -409,3 +516,6 @@ def audit(sender: str, decoded: List[Tuple[str, bytes]]) -> dict:
         "retransmissions": result["retransmissions"],
         "sha256": result["sha256"],
     }
+    if "evidence" in result:
+        ordered["evidence"] = result["evidence"]
+    return ordered
